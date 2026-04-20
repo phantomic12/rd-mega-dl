@@ -1,0 +1,8 @@
+{
+  "rd_api_key": "XXX-123-XXX",
+  "download_dir": "./downloads",
+  "min_wait_ms": 5000,
+  "max_wait_ms": 15000,
+  "server_port": 3000,
+  "max_retries": 3
+}

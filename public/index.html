@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RD-Mega-DL</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="header-left">
+            <h1>RD-Mega-DL</h1>
+            <span class="header-sub">Real-Debrid &times; Mega.nz</span>
+        </div>
+        <div class="header-right">
+            <button id="btn-add" class="btn btn-primary" title="Add Mega Link">+ Add Link</button>
+            <button id="btn-settings" class="btn btn-icon" title="Settings">⚙</button>
+            <button id="btn-logs" class="btn btn-icon" title="Logs">📋</button>
+        </div>
+    </header>
+
+    <!-- Stats bar -->
+    <div id="stats-bar" class="stats-bar">
+        <div class="stat" id="stat-pending"><span class="stat-dot dot-pending"></span><span class="stat-num">0</span> Pending</div>
+        <div class="stat" id="stat-downloading"><span class="stat-dot dot-downloading"></span><span class="stat-num">0</span> Downloading</div>
+        <div class="stat" id="stat-completed"><span class="stat-dot dot-completed"></span><span class="stat-num">0</span> Completed</div>
+        <div class="stat" id="stat-error"><span class="stat-dot dot-error"></span><span class="stat-num">0</span> Errors</div>
+        <div class="stat" id="stat-cancelled"><span class="stat-dot dot-cancelled"></span><span class="stat-num">0</span> Cancelled</div>
+        <div class="stat worker-status" id="worker-badge">● Worker: --</div>
+    </div>
+
+    <!-- Main content -->
+    <main>
+        <!-- Current Download -->
+        <section id="section-current" class="card">
+            <h2>Current Download</h2>
+            <div id="current-download" class="current-empty">No active download</div>
+        </section>
+
+        <!-- Queue -->
+        <section id="section-queue" class="card">
+            <div class="card-header">
+                <h2>Queue <span id="queue-count" class="badge">0</span></h2>
+            </div>
+            <div id="queue-list" class="job-list"></div>
+        </section>
+
+        <!-- Collapsible sections -->
+        <section class="card">
+            <div class="card-header clickable" data-toggle="completed-list">
+                <h2>Completed <span id="completed-count" class="badge">0</span></h2>
+                <span class="chevron">▾</span>
+            </div>
+            <div id="completed-list" class="job-list collapsed"></div>
+        </section>
+
+        <section class="card">
+            <div class="card-header clickable" data-toggle="error-list">
+                <h2>Errors <span id="error-count" class="badge badge-error">0</span></h2>
+                <span class="chevron">▾</span>
+            </div>
+            <div id="error-list" class="job-list collapsed"></div>
+            <div id="error-actions" class="card-footer hidden">
+                <button class="btn btn-warn" id="btn-retry-all">Retry All Failed</button>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-header clickable" data-toggle="cancelled-list">
+                <h2>Cancelled <span id="cancelled-count" class="badge">0</span></h2>
+                <span class="chevron">▾</span>
+            </div>
+            <div id="cancelled-list" class="job-list collapsed"></div>
+        </section>
+    </main>
+
+    <!-- ═══ DIALOGS ═══ -->
+
+    <!-- Add Link Dialog -->
+    <dialog id="dialog-add">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h2>Add Mega Folder Link</h2>
+                <button class="btn-close" data-close="dialog-add">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <label for="mega-url">Mega.nz Folder URL</label>
+                <textarea id="mega-url" rows="3" placeholder="https://mega.nz/folder/XXXXXX#YYYYYY"></textarea>
+                <div id="add-status" class="add-status hidden"></div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-primary" id="btn-submit-link">Submit</button>
+                <button class="btn" data-close="dialog-add">Cancel</button>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Settings Dialog -->
+    <dialog id="dialog-settings">
+        <div class="dialog-content">
+            <div class="dialog-header">
+                <h2>Settings</h2>
+                <button class="btn-close" data-close="dialog-settings">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="form-group">
+                    <label>RD API Key</label>
+                    <input type="password" id="cfg-api-key" placeholder="Your Real-Debrid API key">
+                    <button class="btn btn-sm" id="btn-test-key">Test</button>
+                    <span id="key-test-result"></span>
+                </div>
+                <div class="form-group">
+                    <label>Download Directory</label>
+                    <input type="text" id="cfg-download-dir" placeholder="./downloads">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Min Wait (ms)</label>
+                        <input type="number" id="cfg-min-wait" min="0" step="1000">
+                    </div>
+                    <div class="form-group">
+                        <label>Max Wait (ms)</label>
+                        <input type="number" id="cfg-max-wait" min="0" step="1000">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Max Retries</label>
+                    <input type="number" id="cfg-max-retries" min="0" max="50">
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn btn-primary" id="btn-save-config">Save</button>
+                <button class="btn" data-close="dialog-settings">Cancel</button>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Log Viewer Dialog -->
+    <dialog id="dialog-logs">
+        <div class="dialog-content dialog-wide">
+            <div class="dialog-header">
+                <h2>Application Logs</h2>
+                <button class="btn-close" data-close="dialog-logs">&times;</button>
+            </div>
+            <div class="dialog-body">
+                <div class="log-filters">
+                    <button class="btn btn-sm log-filter active" data-level="">ALL</button>
+                    <button class="btn btn-sm log-filter" data-level="INFO">INFO</button>
+                    <button class="btn btn-sm log-filter" data-level="WARN">WARN</button>
+                    <button class="btn btn-sm log-filter" data-level="ERROR">ERROR</button>
+                    <button class="btn btn-sm" id="btn-clear-logs" style="margin-left:auto;">Clear</button>
+                </div>
+                <div id="log-output" class="log-output"></div>
+            </div>
+        </div>
+    </dialog>
+
+    <script src="app.js"></script>
+</body>
+</html>
