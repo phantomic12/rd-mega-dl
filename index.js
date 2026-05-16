@@ -145,7 +145,7 @@ fastify.post('/api/config', async (req, reply) => {
         return reply.status(400).send({ error: 'Invalid config body' });
     }
     const config = worker.getConfig();
-    const allowed = ['rd_api_key', 'download_dir', 'min_wait_ms', 'max_wait_ms', 'server_port', 'max_retries'];
+    const allowed = ['rd_api_key', 'download_dir', 'min_wait_ms', 'max_wait_ms', 'server_port', 'max_retries', 'concurrent_downloads', 'unrestrict_batch_size', 'unrestrict_batch_delay_ms'];
     for (const key of Object.keys(updates)) {
         if (allowed.includes(key)) {
             config[key] = updates[key];

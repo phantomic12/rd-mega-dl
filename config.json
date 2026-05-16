@@ -1,8 +1,10 @@
 {
-  "rd_api_key": "XXX-123-XXX",
-  "download_dir": "./downloads",
-  "min_wait_ms": 5000,
-  "max_wait_ms": 15000,
+  "download_dir": "/home/yoav/projects/rd-mega-dl/downloads",
+  "min_wait_ms": 1000,
+  "max_wait_ms": 3000,
   "server_port": 3000,
-  "max_retries": 3
+  "max_retries": 3,
+  "concurrent_downloads": 6,
+  "unrestrict_batch_size": 10,
+  "unrestrict_batch_delay_ms": 300
 }

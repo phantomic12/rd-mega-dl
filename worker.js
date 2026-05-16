@@ -10,21 +10,55 @@ const RD_BASE = 'https://api.real-debrid.com/rest/1.0';
 
 // ── Config hot-reload ────────────────────────────────────────
 
-function getConfig() {
-    const cfgPath = path.join(__dirname, 'config.json');
-    if (!fs.existsSync(cfgPath)) {
-        const defaults = {
-            rd_api_key: 'XXX-123-XXX',
-            download_dir: './downloads',
-            min_wait_ms: 5000,
-            max_wait_ms: 15000,
-            server_port: 3000,
-            max_retries: 3
-        };
-        fs.writeFileSync(cfgPath, JSON.stringify(defaults, null, 2));
-        return defaults;
+function loadEnv() {
+    const envPath = path.join(__dirname, '.env');
+    if (fs.existsSync(envPath)) {
+        const lines = fs.readFileSync(envPath, 'utf-8').split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+            const eqIdx = trimmed.indexOf('=');
+            if (eqIdx === -1) continue;
+            const key = trimmed.slice(0, eqIdx).trim();
+            const val = trimmed.slice(eqIdx + 1).trim();
+            if (!process.env[key]) process.env[key] = val;
+        }
     }
-    return JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+}
+
+function getConfig() {
+    loadEnv();
+
+    const cfgPath = path.join(__dirname, 'config.json');
+    const defaults = {
+        download_dir: './downloads',
+        min_wait_ms: 5000,
+        max_wait_ms: 15000,
+        server_port: 3000,
+        max_retries: 3,
+        concurrent_downloads: 4,
+        unrestrict_batch_size: 10,
+        unrestrict_batch_delay_ms: 300
+    };
+
+    let fileCfg = {};
+    if (fs.existsSync(cfgPath)) {
+        fileCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    } else {
+        fs.writeFileSync(cfgPath, JSON.stringify(defaults, null, 2));
+    }
+
+    // Merge: config.json wins for non-secret settings, .env wins for rd_api_key
+    const config = { ...defaults, ...fileCfg };
+
+    // API key: .env takes priority, then config.json, then env var
+    if (process.env.RD_API_KEY) {
+        config.rd_api_key = process.env.RD_API_KEY;
+    } else if (fileCfg.rd_api_key) {
+        config.rd_api_key = fileCfg.rd_api_key;
+    }
+
+    return config;
 }
 
 // ── Worker state ─────────────────────────────────────────────
@@ -33,12 +67,12 @@ let running = false;
 let isPaused = false;
 let pauseReason = '';
 let pauseUntil = null;
-let currentJobId = null;
-let currentStream = null;
-let lastDownloadTime = 0;
+let activeStreams = new Map();       // jobId → stream (for cancellation)
+let jobNameIndex = new Map();        // filename_lower → [job, ...]
+let currentFolderId = null;
 
 function getStatus() {
-    return { running, isPaused, currentJobId, pauseReason, pauseUntil };
+    return { running, isPaused, pauseReason, pauseUntil, activeDownloads: activeStreams.size };
 }
 
 function pause(reason = 'Manual pause') {
@@ -56,10 +90,11 @@ function resume() {
 
 function stop() {
     running = false;
-    if (currentStream) {
-        currentStream.destroy();
-        currentStream = null;
+    // Destroy all active download streams
+    for (const [jobId, stream] of activeStreams) {
+        try { stream.destroy(); } catch {}
     }
+    activeStreams.clear();
 }
 
 // ── Utilities ────────────────────────────────────────────────
@@ -68,21 +103,15 @@ function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
 }
 
-function randomDelay(min, max) {
-    return Math.floor(Math.random() * (max - min) + min);
-}
-
 function sanitizeFilename(name) {
     if (!name) return 'unnamed';
     let s = name
-        .replace(/\.\./g, '_')        // prevent path traversal
-        .replace(/\0/g, '')           // null bytes
-        .replace(/[<>:"|?*]/g, '_')   // Windows-illegal chars
-        .replace(/\\/g, '_')          // backslash
-        .replace(/\//g, '_');         // forward slash
-    // Trim trailing dots and spaces (Windows)
+        .replace(/\.\./g, '_')
+        .replace(/\0/g, '')
+        .replace(/[<>:"|?*]/g, '_')
+        .replace(/\\/g, '_')
+        .replace(/\//g, '_');
     s = s.replace(/[\s.]+$/, '');
-    // Truncate but preserve extension
     if (s.length > 200) {
         const ext = path.extname(s);
         s = s.slice(0, 200 - ext.length) + ext;
@@ -95,15 +124,8 @@ function sanitizeFilename(name) {
 const PERMANENT_CODES = new Set([2, 3, 4, 7, 16, 20, 22, 24, 28, 35, 37]);
 const FATAL_CODES = new Set([8, 9, 14, 15]);
 const TRANSIENT_WAIT = {
-    5: 30000,     // Slow down
-    6: 60000,     // Resource unreachable
-    17: 300000,   // Hoster maintenance
-    18: 600000,   // Hoster limit reached
-    19: 120000,   // Hoster temp unavailable
-    21: 60000,    // Too many active downloads
-    25: 120000,   // Service unavailable
-    33: 60000,    // Torrent already active
-    36: 600000    // Fair usage limit
+    5: 30000, 6: 60000, 17: 300000, 18: 600000,
+    19: 120000, 21: 60000, 25: 120000, 33: 60000, 36: 600000
 };
 
 function classifyError(err) {
@@ -115,29 +137,13 @@ function classifyError(err) {
         const retryAfter = parseInt(err.response?.headers?.['retry-after'] || '60', 10) * 1000;
         return { type: 'rate_limit', wait: retryAfter, message: errorMsg, errorCode: 34 };
     }
-    if (FATAL_CODES.has(errorCode)) {
-        return { type: 'fatal', message: errorMsg, errorCode };
-    }
-    if (PERMANENT_CODES.has(errorCode)) {
-        return { type: 'permanent', message: errorMsg, errorCode };
-    }
-    if (TRANSIENT_WAIT[errorCode]) {
-        return { type: 'transient', wait: TRANSIENT_WAIT[errorCode], message: errorMsg, errorCode };
-    }
-    if (errorCode === 23) {
-        return { type: 'fatal', message: 'Traffic exhausted', errorCode: 23 };
-    }
-    // Network errors (no response)
-    if (!err.response) {
-        return { type: 'transient', wait: 30000, message: `Network error: ${err.message}`, errorCode: null };
-    }
-    // Unknown HTTP errors
-    if (status >= 500) {
-        return { type: 'transient', wait: 60000, message: errorMsg, errorCode };
-    }
-    if (status >= 400) {
-        return { type: 'permanent', message: errorMsg, errorCode };
-    }
+    if (FATAL_CODES.has(errorCode)) return { type: 'fatal', message: errorMsg, errorCode };
+    if (PERMANENT_CODES.has(errorCode)) return { type: 'permanent', message: errorMsg, errorCode };
+    if (TRANSIENT_WAIT[errorCode]) return { type: 'transient', wait: TRANSIENT_WAIT[errorCode], message: errorMsg, errorCode };
+    if (errorCode === 23) return { type: 'fatal', message: 'Traffic exhausted', errorCode: 23 };
+    if (!err.response) return { type: 'transient', wait: 30000, message: `Network error: ${err.message}`, errorCode: null };
+    if (status >= 500) return { type: 'transient', wait: 60000, message: errorMsg, errorCode };
+    if (status >= 400) return { type: 'permanent', message: errorMsg, errorCode };
     return { type: 'transient', wait: 30000, message: errorMsg, errorCode };
 }
 
@@ -154,16 +160,15 @@ async function unrestrictFolder(folderUrl) {
         headers: { ...rdHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 30000
     });
-    return resp.data; // array of URL strings
+    return resp.data;
 }
 
 async function unrestrictLink(link) {
-    db.addLog('INFO', 'rd', `Unrestricting link: ${link.slice(0, 80)}...`);
     const resp = await axios.post(`${RD_BASE}/unrestrict/link`, `link=${encodeURIComponent(link)}`, {
         headers: { ...rdHeaders(), 'Content-Type': 'application/x-www-form-urlencoded' },
         timeout: 30000
     });
-    return resp.data; // { id, filename, mimeType, filesize, link, host, chunks, crc, download, streamable }
+    return resp.data;
 }
 
 async function checkUser() {
@@ -200,15 +205,14 @@ async function parseMegaFolder(megaUrl, folderId) {
                 jobs.push({
                     mega_folder_url: megaUrl,
                     mega_folder_name: folderName,
-                    filename: node.name, // original unsanitized for matching
-                    relative_path: relativePath.replace(/\\/g, '/'), // normalize to forward slashes
+                    filename: node.name,
+                    relative_path: relativePath.replace(/\\/g, '/'),
                     file_size_mega: node.size || 0,
                     status: 'pending'
                 });
             }
         }
 
-        // Root folder children
         if (folder.children) {
             for (const child of folder.children) {
                 traverse(child, folderName);
@@ -221,12 +225,11 @@ async function parseMegaFolder(megaUrl, folderId) {
             return;
         }
 
-        // Batch insert
         db.addJobsBatch(jobs);
         db.updateFolder(folderId, { folder_name: folderName, total_files: jobs.length, status: 'queued' });
         db.addLog('INFO', 'mega', `Parsed ${jobs.length} files from "${folderName}"`);
 
-        // Create directories on disk
+        // Create directory tree
         const config = getConfig();
         const dirs = new Set();
         for (const j of jobs) {
@@ -238,8 +241,8 @@ async function parseMegaFolder(megaUrl, folderId) {
         }
         db.addLog('INFO', 'mega', `Created ${dirs.size} directories`);
 
-        // Now unrestrict folder via RD to get individual links
-        await matchRdLinks(megaUrl, folderId);
+        // Phase 1: Batch unrestrict all links
+        await batchUnrestrictAndMatch(megaUrl, folderId);
 
     } catch (err) {
         db.updateFolder(folderId, { status: 'error', error_message: err.message });
@@ -247,113 +250,142 @@ async function parseMegaFolder(megaUrl, folderId) {
     }
 }
 
-// ── Matching RD links to megajs tree ─────────────────────────
+// ── Phase 1: Batch Unrestrict & Match ────────────────────────
 
-async function matchRdLinks(megaUrl, folderId) {
-    db.addLog('INFO', 'rd', 'Starting RD folder unrestriction and matching...');
+async function batchUnrestrictAndMatch(megaUrl, folderId) {
+    db.addLog('INFO', 'rd', 'Phase 1: Batch unrestricting all links...');
     db.updateFolder(folderId, { status: 'in_progress' });
+    currentFolderId = folderId;
 
     let rdLinks;
     try {
         rdLinks = await unrestrictFolder(megaUrl);
     } catch (err) {
-        db.addLog('WARN', 'rd', `RD /unrestrict/folder failed: ${err.message}. Files will be unrestricted individually.`);
-        return; // Jobs stay pending, worker will unrestrict individually
-    }
-
-    if (!Array.isArray(rdLinks) || rdLinks.length === 0) {
-        db.addLog('WARN', 'rd', 'RD returned empty folder links. Files will be unrestricted individually.');
+        db.addLog('ERROR', 'rd', `RD /unrestrict/folder failed: ${err.message}`);
         return;
     }
 
-    db.addLog('INFO', 'rd', `RD returned ${rdLinks.length} links from folder`);
-
-    // Get all jobs for this folder
-    const jobs = db.getJobsByFolder(megaUrl);
-
-    // Build match map: filename -> [job, ...]
-    const nameMap = new Map();
-    for (const j of jobs) {
-        const key = j.filename.toLowerCase();
-        if (!nameMap.has(key)) nameMap.set(key, []);
-        nameMap.get(key).push(j);
+    if (!Array.isArray(rdLinks) || rdLinks.length === 0) {
+        db.addLog('WARN', 'rd', 'RD returned empty folder links.');
+        return;
     }
 
-    // Unrestrict each RD link and match
-    let matchedCount = 0;
+    db.addLog('INFO', 'rd', `Got ${rdLinks.length} links. Building name index...`);
+
+    // Build filename → job lookup
+    const jobs = db.getJobsByFolder(megaUrl);
+    jobNameIndex.clear();
+    for (const job of jobs) {
+        const key = job.filename.toLowerCase();
+        if (!jobNameIndex.has(key)) jobNameIndex.set(key, []);
+        jobNameIndex.get(key).push(job);
+    }
+    db.addLog('INFO', 'rd', `Name index: ${jobNameIndex.size} unique filenames`);
+
+    // Process in parallel batches
     const config = getConfig();
+    const BATCH_SIZE = config.unrestrict_batch_size || 10;
+    const BATCH_DELAY = config.unrestrict_batch_delay_ms || 300;
 
-    for (let i = 0; i < rdLinks.length; i++) {
-        const rdUrl = rdLinks[i];
-        try {
-            // Throttle: small delay between unrestrict calls to respect rate limits
-            if (i > 0) await sleep(300);
+    let matchedCount = 0;
+    let orphanCount = 0;
+    const startTime = Date.now();
 
-            const rdData = await unrestrictLink(rdUrl);
-            const rdFilename = rdData.filename || '';
-            const rdFilesize = rdData.filesize || 0;
-            const rdDownloadUrl = rdData.download;
+    for (let i = 0; i < rdLinks.length; i += BATCH_SIZE) {
+        if (!running) break;
 
-            // Try exact filename match
-            const candidates = nameMap.get(rdFilename.toLowerCase()) || [];
+        const batch = rdLinks.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(rdLinks.length / BATCH_SIZE);
 
-            let matched = null;
-            if (candidates.length === 1) {
-                matched = candidates[0];
-            } else if (candidates.length > 1) {
-                // Try size match within tolerance
-                matched = candidates.find(c =>
-                    !c.rd_download_url && Math.abs(c.file_size_mega - rdFilesize) < 1024
-                );
-                // Fallback: first unmatched
-                if (!matched) matched = candidates.find(c => !c.rd_download_url);
-            }
+        // Unrestrict entire batch in parallel
+        const results = await Promise.allSettled(
+            batch.map(url => unrestrictLink(url).catch(e => ({ __error: e })))
+        );
 
-            if (matched) {
-                db.updateRdData(matched.id, {
-                    rdLink: rdUrl,
-                    rdDownloadUrl: rdDownloadUrl,
-                    rdFilename: rdFilename,
-                    rdFilesize: rdFilesize
-                });
-                matched.rd_download_url = rdDownloadUrl; // mark locally
-                matchedCount++;
-                db.addLog('DEBUG', 'rd', `Matched: ${rdFilename} -> ${matched.relative_path}`);
-            } else {
-                // No match — create as flat file under folder
-                const folderInfo = db.getFolder(folderId);
-                const folderName = folderInfo?.folder_name || 'MegaFolder';
-                const relPath = `${folderName}/${sanitizeFilename(rdFilename)}`;
-                db.addJob({
-                    mega_folder_url: megaUrl,
-                    mega_folder_name: folderName,
-                    filename: rdFilename,
-                    relative_path: relPath,
-                    file_size_mega: rdFilesize,
-                    status: 'pending'
-                });
-                // Update the new job with RD data
-                const newJob = db.getDb().prepare("SELECT id FROM jobs WHERE relative_path = ? AND mega_folder_url = ? ORDER BY id DESC LIMIT 1").get(relPath, megaUrl);
-                if (newJob) {
-                    db.updateRdData(newJob.id, { rdLink: rdUrl, rdDownloadUrl: rdDownloadUrl, rdFilename, rdFilesize });
+        // Match each result to a job
+        for (const r of results) {
+            if (r.status === 'rejected' || r.value?.__error) {
+                const err = r.value?.__error || r.reason;
+                const classified = classifyError(err);
+                if (classified.type === 'rate_limit') {
+                    db.addLog('WARN', 'rd', `Rate limited during batch unrestrict. Pausing ${classified.wait / 1000}s...`);
+                    await sleep(classified.wait);
+                    // Re-process this link
+                    i -= BATCH_SIZE; // rewind batch
+                    break;
                 }
-                const dir = path.dirname(path.join(config.download_dir, relPath));
-                fs.mkdirSync(dir, { recursive: true });
-                db.addLog('WARN', 'rd', `No tree match for "${rdFilename}", saved to ${relPath}`);
-            }
-        } catch (err) {
-            const classified = classifyError(err);
-            if (classified.type === 'rate_limit') {
-                db.addLog('WARN', 'rd', `Rate limited during matching. Waiting ${classified.wait / 1000}s`);
-                await sleep(classified.wait);
-                i--; // retry this one
                 continue;
             }
-            db.addLog('ERROR', 'rd', `Failed to unrestrict link ${i + 1}: ${classified.message}`);
+
+            const rdData = r.value;
+            const filename = rdData.filename || '';
+            const filesize = rdData.filesize || 0;
+            const downloadUrl = rdData.download;
+
+            if (!downloadUrl) continue;
+
+            // Find matching job by filename
+            const candidates = jobNameIndex.get(filename.toLowerCase()) || [];
+            let matchedJob = null;
+
+            if (candidates.length === 1) {
+                matchedJob = candidates[0];
+            } else if (candidates.length > 1) {
+                matchedJob = candidates.find(j =>
+                    !j.rd_download_url && Math.abs((j.file_size_mega || 0) - filesize) < 1024
+                );
+                if (!matchedJob) matchedJob = candidates.find(j => !j.rd_download_url);
+            }
+
+            if (matchedJob) {
+                db.updateRdData(matchedJob.id, {
+                    rdLink: '', // link already consumed
+                    rdDownloadUrl: downloadUrl,
+                    rdFilename: filename,
+                    rdFilesize: filesize
+                });
+                // Mark in-memory object too so size matching works for duplicates
+                matchedJob.rd_download_url = downloadUrl;
+                matchedCount++;
+            } else {
+                // Orphan — save under _unmatched/
+                orphanCount++;
+                const folderInfo = db.getFolder(folderId);
+                const folderName = folderInfo?.folder_name || 'MegaFolder';
+                const relPath = `${folderName}/_unmatched/${sanitizeFilename(filename)}`;
+                const orphanId = db.addJob({
+                    mega_folder_url: megaUrl,
+                    mega_folder_name: folderName,
+                    filename: filename,
+                    relative_path: relPath,
+                    file_size_mega: filesize,
+                    status: 'pending'
+                });
+                db.updateRdData(orphanId, {
+                    rdLink: '',
+                    rdDownloadUrl: downloadUrl,
+                    rdFilename: filename,
+                    rdFilesize: filesize
+                });
+                const dir = path.dirname(path.join(config.download_dir, relPath));
+                fs.mkdirSync(dir, { recursive: true });
+            }
+        }
+
+        // Progress
+        const pct = ((i + BATCH_SIZE) / rdLinks.length * 100).toFixed(1);
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+        db.addLog('INFO', 'rd', `Batch ${batchNum}/${totalBatches} (${pct}%) — ${matchedCount} matched, ${orphanCount} orphans — ${elapsed}s elapsed`);
+
+        if (i + BATCH_SIZE < rdLinks.length) {
+            await sleep(BATCH_DELAY);
         }
     }
 
-    db.addLog('INFO', 'rd', `Matching complete: ${matchedCount}/${rdLinks.length} matched to tree`);
+    const totalTime = ((Date.now() - startTime) / 1000).toFixed(0);
+    db.addLog('INFO', 'rd', `Phase 1 complete: ${matchedCount + orphanCount}/${rdLinks.length} unrestricted in ${totalTime}s (${matchedCount} matched, ${orphanCount} orphans)`);
+    db.updateFolder(folderId, { status: 'queued' });
 }
 
 // ── Download engine ──────────────────────────────────────────
@@ -364,17 +396,16 @@ async function downloadFile(job) {
     const dir = path.dirname(localPath);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Clean up partial file on retry
     if (fs.existsSync(localPath)) {
         fs.unlinkSync(localPath);
     }
 
     const url = job.rd_download_url;
-    db.addLog('INFO', 'worker', `Downloading: ${job.filename} -> ${job.relative_path}`);
+    db.addLog('INFO', 'worker', `[#${job.id}] Downloading: ${job.filename} -> ${job.relative_path}`);
 
     const response = await axios.get(url, {
         responseType: 'stream',
-        timeout: 0, // no timeout for downloads
+        timeout: 0,
         headers: rdHeaders()
     });
 
@@ -385,7 +416,7 @@ async function downloadFile(job) {
 
     return new Promise((resolve, reject) => {
         const writer = fs.createWriteStream(localPath);
-        currentStream = response.data;
+        activeStreams.set(job.id, response.data);
 
         let bytesReceived = 0;
         let lastProgressUpdate = 0;
@@ -396,7 +427,6 @@ async function downloadFile(job) {
             if (now - lastProgressUpdate >= 1000) {
                 lastProgressUpdate = now;
                 db.updateProgress(job.id, bytesReceived);
-                // Check for external cancellation
                 const current = db.getJob(job.id);
                 if (current && current.status === 'cancelled') {
                     response.data.destroy();
@@ -411,26 +441,22 @@ async function downloadFile(job) {
         response.data.pipe(writer);
 
         writer.on('finish', () => {
-            currentStream = null;
+            activeStreams.delete(job.id);
             db.updateProgress(job.id, bytesReceived);
-            db.addLog('INFO', 'worker', `Completed: ${job.filename} (${formatBytes(bytesReceived)})`);
+            db.addLog('INFO', 'worker', `[#${job.id}] Completed: ${job.filename} (${formatBytes(bytesReceived)})`);
             resolve();
         });
 
         writer.on('error', (err) => {
-            currentStream = null;
-            if (fs.existsSync(localPath)) {
-                try { fs.unlinkSync(localPath); } catch {}
-            }
+            activeStreams.delete(job.id);
+            if (fs.existsSync(localPath)) { try { fs.unlinkSync(localPath); } catch {} }
             reject(err);
         });
 
         response.data.on('error', (err) => {
-            currentStream = null;
+            activeStreams.delete(job.id);
             writer.destroy();
-            if (fs.existsSync(localPath)) {
-                try { fs.unlinkSync(localPath); } catch {}
-            }
+            if (fs.existsSync(localPath)) { try { fs.unlinkSync(localPath); } catch {} }
             reject(err);
         });
     });
@@ -444,152 +470,117 @@ function formatBytes(bytes) {
     return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
 }
 
-// ── Error handler ────────────────────────────────────────────
+// ── Phase 2: Parallel download pool ──────────────────────────
 
-async function handleError(job, err) {
-    const classified = classifyError(err);
+async function downloadWorker(workerId) {
     const config = getConfig();
 
-    db.addLog('ERROR', 'worker', `Error on "${job.filename}": [${classified.type}] ${classified.message}`);
+    while (running) {
+        if (isPaused) {
+            await sleep(2000);
+            continue;
+        }
 
-    if (classified.type === 'rate_limit') {
-        // Global pause, do NOT increment retry
-        isPaused = true;
-        pauseReason = `Rate limited (429). Waiting ${classified.wait / 1000}s`;
-        pauseUntil = Date.now() + classified.wait;
-        db.updateStatus(job.id, 'pending'); // re-queue
-        db.addLog('WARN', 'worker', pauseReason);
-        await sleep(classified.wait);
-        isPaused = false;
-        pauseReason = '';
-        pauseUntil = null;
-        return;
+        // Atomically claim a job
+        const job = db.claimNextJob();
+        if (!job) {
+            await sleep(1000);
+            continue;
+        }
+
+        try {
+            await downloadFile(job);
+            db.updateStatus(job.id, 'completed');
+            db.updateCompletedAt(job.id);
+            db.updateFolderCompletedCount(job.mega_folder_url);
+
+        } catch (err) {
+            if (err.message === 'Download cancelled') {
+                db.updateStatus(job.id, 'cancelled');
+                db.addLog('INFO', 'worker', `[W${workerId}] [#${job.id}] Cancelled`);
+                continue;
+            }
+
+            const classified = classifyError(err);
+            db.addLog('ERROR', 'worker', `[W${workerId}] [#${job.id}] ${job.filename}: [${classified.type}] ${classified.message}`);
+
+            if (classified.type === 'rate_limit') {
+                // Global pause
+                isPaused = true;
+                pauseReason = `Rate limited. Waiting ${classified.wait / 1000}s`;
+                pauseUntil = Date.now() + classified.wait;
+                db.updateStatus(job.id, 'pending');
+                db.addLog('WARN', 'worker', `[W${workerId}] ${pauseReason}`);
+                await sleep(classified.wait);
+                isPaused = false;
+                pauseReason = '';
+                pauseUntil = null;
+                continue;
+            }
+
+            if (classified.type === 'fatal') {
+                isPaused = true;
+                pauseReason = `Fatal: ${classified.message}`;
+                db.updateStatus(job.id, 'error');
+                db.setErrorMessage(job.id, classified.message, classified.errorCode);
+                db.addLog('ERROR', 'worker', `[W${workerId}] FATAL: ${classified.message}. Worker paused.`);
+                return; // stop this worker
+            }
+
+            if (classified.type === 'permanent') {
+                db.updateStatus(job.id, 'error');
+                db.setErrorMessage(job.id, classified.message, classified.errorCode);
+                continue;
+            }
+
+            // Transient error
+            const newRetry = (job.retry_count || 0) + 1;
+            if (newRetry > config.max_retries) {
+                db.updateStatus(job.id, 'error');
+                db.setErrorMessage(job.id, `Max retries exceeded. Last: ${classified.message}`, classified.errorCode);
+                db.addLog('ERROR', 'worker', `[W${workerId}] [#${job.id}] Max retries reached`);
+                continue;
+            }
+
+            db.updateRetryCount(job.id, newRetry);
+            db.updateStatus(job.id, 'pending');
+            db.setErrorMessage(job.id, null, null);
+            db.addLog('WARN', 'worker', `[W${workerId}] [#${job.id}] Retry ${newRetry}/${config.max_retries}`);
+
+            if (classified.wait) {
+                await sleep(classified.wait);
+            }
+        }
     }
 
-    if (classified.type === 'fatal') {
-        // Stop everything
-        isPaused = true;
-        pauseReason = `Fatal: ${classified.message}`;
-        db.updateStatus(job.id, 'error');
-        db.setErrorMessage(job.id, classified.message, classified.errorCode);
-        db.addLog('ERROR', 'worker', `FATAL ERROR: ${classified.message}. Worker paused.`);
-        return;
-    }
-
-    if (classified.type === 'permanent') {
-        db.updateStatus(job.id, 'error');
-        db.setErrorMessage(job.id, classified.message, classified.errorCode);
-        return;
-    }
-
-    // Transient error
-    const newRetry = (job.retry_count || 0) + 1;
-    if (newRetry > config.max_retries) {
-        db.updateStatus(job.id, 'error');
-        db.setErrorMessage(job.id, `Max retries (${config.max_retries}) exceeded. Last: ${classified.message}`, classified.errorCode);
-        db.addLog('ERROR', 'worker', `Max retries reached for "${job.filename}"`);
-        return;
-    }
-
-    db.updateRetryCount(job.id, newRetry);
-    db.updateStatus(job.id, 'pending');
-    db.setErrorMessage(job.id, null, null);
-    db.addLog('WARN', 'worker', `Retry ${newRetry}/${config.max_retries} for "${job.filename}" (waiting ${classified.wait / 1000}s)`);
-
-    if (classified.wait) {
-        await sleep(classified.wait);
-    }
+    db.addLog('INFO', 'worker', `Worker ${workerId} stopped`);
 }
-
-// ── Main worker loop ─────────────────────────────────────────
 
 async function start() {
     if (running) return;
     running = true;
-    db.addLog('INFO', 'worker', 'Download worker started');
 
+    const config = getConfig();
+    const concurrency = config.concurrent_downloads || 4;
+
+    db.addLog('INFO', 'worker', `Phase 2: Starting ${concurrency} parallel download workers`);
+
+    // Wait until we have matched jobs
     while (running) {
-        if (isPaused) {
-            await sleep(5000);
-            // Auto-resume if pause timer expired
-            if (pauseUntil && Date.now() >= pauseUntil) {
-                resume();
-            }
-            continue;
-        }
-
-        const config = getConfig();
-        const job = getNextPending();
-
-        if (!job) {
-            await sleep(5000);
-            continue;
-        }
-
-        currentJobId = job.id;
-
-        // Check if cancelled before starting
-        const freshJob = db.getJob(job.id);
-        if (!freshJob || freshJob.status === 'cancelled') {
-            currentJobId = null;
-            continue;
-        }
-
-        // Random delay between downloads
-        if (lastDownloadTime > 0) {
-            const delay = randomDelay(config.min_wait_ms, config.max_wait_ms);
-            db.addLog('INFO', 'worker', `Waiting ${(delay / 1000).toFixed(1)}s before next download...`);
-            await sleep(delay);
-        }
-
-        try {
-            // Step 1: Unrestrict if needed
-            if (!freshJob.rd_download_url) {
-                db.updateStatus(job.id, 'unrestricting');
-                let linkToUnrestrict = freshJob.rd_link;
-
-                // If no rd_link either, we need the individual file URL — this shouldn't happen
-                // if matching worked, but handle it
-                if (!linkToUnrestrict) {
-                    db.addLog('WARN', 'worker', `No RD link for "${job.filename}". Marking as error.`);
-                    db.updateStatus(job.id, 'error');
-                    db.setErrorMessage(job.id, 'No RD link available. Folder unrestriction may have failed.');
-                    currentJobId = null;
-                    continue;
-                }
-
-                const rdResult = await unrestrictLink(linkToUnrestrict);
-                db.updateRdData(job.id, {
-                    rdLink: linkToUnrestrict,
-                    rdDownloadUrl: rdResult.download,
-                    rdFilename: rdResult.filename,
-                    rdFilesize: rdResult.filesize
-                });
-                freshJob.rd_download_url = rdResult.download;
-                freshJob.rd_filesize = rdResult.filesize;
-            }
-
-            // Step 2: Download
-            db.updateStatus(job.id, 'downloading');
-            db.updateStartedAt(job.id);
-            await downloadFile({ ...freshJob, rd_download_url: freshJob.rd_download_url });
-            db.updateStatus(job.id, 'completed');
-            db.updateCompletedAt(job.id);
-            db.updateFolderCompletedCount(freshJob.mega_folder_url);
-            lastDownloadTime = Date.now();
-
-        } catch (err) {
-            if (err.message === 'Download cancelled') {
-                db.addLog('INFO', 'worker', `Download cancelled: ${job.filename}`);
-            } else {
-                await handleError(freshJob, err);
-            }
-        }
-
-        currentJobId = null;
+        const stats = db.getJobStats();
+        const ready = stats.pending || 0;
+        if (ready > 0) break;
+        await sleep(2000);
     }
 
-    db.addLog('INFO', 'worker', 'Download worker stopped');
+    // Spawn concurrent workers
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(downloadWorker(i + 1));
+    }
+
+    await Promise.all(workers);
+    db.addLog('INFO', 'worker', 'All download workers stopped');
 }
 
 module.exports = {

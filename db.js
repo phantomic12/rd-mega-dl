@@ -177,9 +177,22 @@ function addJobsBatch(jobsArray) {
 function getNextPending() {
     return getDb().prepare(
         "SELECT * FROM jobs WHERE status = 'pending' AND rd_download_url IS NOT NULL ORDER BY added_at ASC LIMIT 1"
-    ).get() || getDb().prepare(
-        "SELECT * FROM jobs WHERE status = 'pending' ORDER BY added_at ASC LIMIT 1"
     ).get();
+}
+
+function claimNextJob() {
+    // Atomically claim a job: update status and return the row in one transaction
+    const d = getDb();
+    const claim = d.transaction(() => {
+        const job = d.prepare(
+            "SELECT * FROM jobs WHERE status = 'pending' AND rd_download_url IS NOT NULL ORDER BY added_at ASC LIMIT 1"
+        ).get();
+        if (job) {
+            d.prepare("UPDATE jobs SET status = 'downloading', started_at = datetime('now') WHERE id = ?").run(job.id);
+        }
+        return job;
+    });
+    return claim();
 }
 
 function getJob(id) {
@@ -271,7 +284,7 @@ module.exports = {
     initDb, getDb, closeDb,
     addLog, getLogs, clearLogs,
     addFolder, updateFolder, getAllFolders, getFolder,
-    addJob, addJobsBatch, getNextPending, getJob, getAllJobs, getJobsByFolder, getJobStats,
+    addJob, addJobsBatch, getNextPending, claimNextJob, getJob, getAllJobs, getJobsByFolder, getJobStats,
     updateStatus, updateProgress, updateRdData, updateStartedAt, updateCompletedAt,
     setErrorMessage, updateRetryCount, resetJob, resetAllFailed,
     deleteJob, clearCompleted, updateFolderCompletedCount

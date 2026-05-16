@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Secrets — NEVER commit these
+.env
+config.json
+
+# Database (generated)
+*.db
+*.db-shm
+*.db-wal
+
+# Downloaded files
+downloads/
+
+# Dev
+*.log
