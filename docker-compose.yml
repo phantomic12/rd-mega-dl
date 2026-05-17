@@ -1,0 +1,19 @@
+services:
+  rd-mega-dl:
+    build: .
+    container_name: rd-mega-dl
+    ports:
+      - "3000:3000"
+    volumes:
+      - rd-data:/app/data
+      - ./downloads:/app/downloads
+      - ./config.json:/app/config.json:ro
+    environment:
+      - DB_PATH=/app/data/downloads.db
+      - DOWNLOAD_DIR=/app/downloads
+      - SERVER_HOST=0.0.0.0
+      - RD_API_KEY=${RD_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  rd-data:

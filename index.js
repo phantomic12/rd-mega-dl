@@ -195,10 +195,11 @@ async function main() {
     // Read config
     const config = worker.getConfig();
     const port = config.server_port || 3000;
+    const host = config.server_host || '127.0.0.1';
 
     // Start Fastify
     try {
-        await fastify.listen({ port, host: '127.0.0.1' });
+        await fastify.listen({ port, host });
         db.addLog('INFO', 'system', `Server running at http://127.0.0.1:${port}`);
         console.log(`\n  🚀 RD-Mega-DL running at http://127.0.0.1:${port}\n`);
     } catch (err) {

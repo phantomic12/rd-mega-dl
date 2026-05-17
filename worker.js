@@ -58,6 +58,11 @@ function getConfig() {
         config.rd_api_key = fileCfg.rd_api_key;
     }
 
+    // Docker-friendly overrides
+    if (process.env.DOWNLOAD_DIR) config.download_dir = process.env.DOWNLOAD_DIR;
+    if (process.env.SERVER_PORT) config.server_port = parseInt(process.env.SERVER_PORT, 10);
+    if (process.env.SERVER_HOST) config.server_host = process.env.SERVER_HOST;
+
     return config;
 }
 

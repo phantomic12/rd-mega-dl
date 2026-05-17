@@ -1,0 +1,11 @@
+node_modules/
+.git/
+downloads/
+*.db
+*.db-shm
+*.db-wal
+.env
+*.log
+Dockerfile
+docker-compose.yml
+.dockerignore
